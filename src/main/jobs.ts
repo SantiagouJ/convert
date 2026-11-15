@@ -23,9 +23,14 @@ function stem(path: string): string {
   const name = basename(path)
   const ext = extOf(name)
   if (!ext) return name
-  // The on-disk extension may be an alias (`.jpeg`), so cut at the matching dot count.
-  const dots = ext.split('.').length
-  return name.split('.').slice(0, -dots).join('.') || name
+  // The on-disk extension may be an alias (`.jpeg`, `.tgz`): try the compound length first and keep the dots that normalize to `ext`.
+  const parts = name.split('.')
+  for (const dots of [2, 1]) {
+    if (parts.length > dots && normalizeExt(parts.slice(-dots).join('.')) === ext) {
+      return parts.slice(0, -dots).join('.')
+    }
+  }
+  return name
 }
 
 export class JobQueue {
