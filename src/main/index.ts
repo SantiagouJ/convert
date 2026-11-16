@@ -101,7 +101,10 @@ function changeSettings(patch: Partial<Settings>): Settings {
 function applySettings(next: Settings): void {
   mainWindow?.setAlwaysOnTop(next.alwaysOnTop)
   const result = shortcuts.apply(next.globalShortcut)
-  if (!result.ok) console.warn(`[shell] ${result.error}`)
+  if (!result.ok) {
+    console.warn(`[shell] ${result.error}`)
+    if (Notification.isSupported()) new Notification({ title: 'Convert', body: result.error ?? '' }).show()
+  }
   // Only a packaged app has a stable exe to start at login.
   if (app.isPackaged) app.setLoginItemSettings({ openAtLogin: next.launchAtLogin, args: [FLAG_HIDDEN] })
   tray?.update(next, explorerRegistered)
