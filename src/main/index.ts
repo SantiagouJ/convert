@@ -1,67 +1,134 @@
-import { join } from 'node:path'
-import { existsSync, statSync } from 'node:fs'
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
-import { IPC, type Settings, type StartJobsRequest } from '@shared/types'
+import { existsSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { app, BrowserWindow, dialog, ipcMain, Notification, shell } from 'electron'
+import { IPC, type Job, type Settings, type StartJobsRequest } from '@shared/types'
 import { JobQueue } from './jobs'
 import { targetsForFiles } from './registry'
 import { SettingsStore } from './settings'
+import { BatchTracker, describeBatch, FileBatcher } from './shell/batching'
+import {
+  isExplorerEntryRegistered,
+  registerExplorerEntry,
+  unregisterExplorerEntry
+} from './shell/explorer'
+import { ShortcutManager } from './shell/shortcut'
+import { AppTray } from './shell/tray'
+import { createMainWindow, filesFromArgv, showWindow, toggleWindow } from './shell/window'
+
+const FLAG_HIDDEN = '--hidden'
+const FLAG_UNREGISTER = '--unregister-shell'
 
 let mainWindow: BrowserWindow | null = null
+let rendererReady = false
+let quitting = false
 let settings: SettingsStore
+let tray: AppTray | null = null
+let explorerRegistered = false
+let lastOutputDir: string | null = null
+const pendingFiles: string[] = []
+const tracker = new BatchTracker()
+const shortcuts = new ShortcutManager(() => toggleWindow(mainWindow))
 
-const queue = new JobQueue({
-  onUpdate: (job) => mainWindow?.webContents.send(IPC.jobUpdate, job)
+const iconPath = (): string =>
+  app.isPackaged ? join(process.resourcesPath, 'icon.png') : join(app.getAppPath(), 'build', 'icon.png')
+
+const queue = new JobQueue({ onUpdate: onJobUpdate })
+
+/** Hands files to the renderer, holding them until it has loaded. */
+function deliverFiles(paths: string[]): void {
+  pendingFiles.push(...paths)
+  flushFiles()
+}
+
+function flushFiles(): void {
+  if (!rendererReady || !mainWindow || pendingFiles.length === 0) return
+  mainWindow.webContents.send(IPC.filesOpened, pendingFiles.splice(0))
+}
+
+// Explorer starts one process per selected file; collect them into one batch.
+const batcher = new FileBatcher((paths) => {
+  showWindow(mainWindow)
+  deliverFiles(paths)
 })
 
-/** File paths passed on a command line ("Open with", drag onto the exe). */
-function filesFromArgv(argv: string[]): string[] {
-  return argv.slice(1).filter((arg) => {
-    if (arg.startsWith('-')) return false
-    try {
-      return existsSync(arg) && statSync(arg).isFile()
-    } catch {
-      return false
-    }
-  })
+function onJobUpdate(job: Job): void {
+  mainWindow?.webContents.send(IPC.jobUpdate, job)
+
+  // Taskbar progress for the whole batch.
+  const summary = tracker.update(job)
+  const fraction = tracker.progress()
+  mainWindow?.setProgressBar(fraction === null ? -1 : fraction)
+  tray?.setProgressTooltip(fraction === null ? 'Convert' : `Convert — ${Math.round(fraction * 100)}%`)
+
+  if (job.status === 'done') lastOutputDir = dirname(job.outputPath)
+  if (!summary) return
+
+  const current = settings.get()
+  if (current.revealWhenDone && summary.firstOutput) shell.showItemInFolder(summary.firstOutput)
+  const unfocused = !mainWindow || !mainWindow.isFocused()
+  if (current.notifyWhenDone && unfocused && Notification.isSupported() && summary.total > 0) {
+    const { title, body } = describeBatch(summary)
+    const notification = new Notification({ title, body })
+    notification.on('click', () => {
+      if (summary.firstOutput) shell.showItemInFolder(summary.firstOutput)
+      else showWindow(mainWindow)
+    })
+    notification.show()
+  }
 }
 
-function sendOpenedFiles(paths: string[]): void {
-  if (paths.length === 0 || !mainWindow) return
-  mainWindow.webContents.send(IPC.filesOpened, paths)
+async function pickAndSendFiles(): Promise<void> {
+  const result = await dialog.showOpenDialog({ properties: ['openFile', 'multiSelections'] })
+  if (result.canceled || result.filePaths.length === 0) return
+  showWindow(mainWindow)
+  deliverFiles(result.filePaths)
 }
 
-function createWindow(): void {
-  mainWindow = new BrowserWindow({
-    width: 460,
-    height: 620,
-    minWidth: 380,
-    minHeight: 480,
-    show: false,
-    autoHideMenuBar: true,
-    backgroundColor: '#14110f',
-    title: 'Convert',
-    webPreferences: {
-      preload: join(__dirname, '../preload/index.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true
-    }
-  })
+function openOutputFolder(): void {
+  const { outputMode, outputDir } = settings.get()
+  const target = lastOutputDir ?? (outputMode === 'folder' && outputDir ? outputDir : app.getPath('documents'))
+  void shell.openPath(target)
+}
 
-  mainWindow.once('ready-to-show', () => mainWindow?.show())
-  mainWindow.on('closed', () => {
-    mainWindow = null
-  })
-  mainWindow.webContents.once('did-finish-load', () => sendOpenedFiles(filesFromArgv(process.argv)))
+function changeSettings(patch: Partial<Settings>): Settings {
+  const next = settings.update(patch)
+  applySettings(next)
+  for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC.settingsChanged, next)
+  return next
+}
 
-  // Dropping a file outside a drop zone must not navigate the window away.
-  mainWindow.webContents.on('will-navigate', (event) => event.preventDefault())
-  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+/** Pushes settings into the running app. Called at startup and after every change. */
+function applySettings(next: Settings): void {
+  mainWindow?.setAlwaysOnTop(next.alwaysOnTop)
+  const result = shortcuts.apply(next.globalShortcut)
+  if (!result.ok) {
+    console.warn(`[shell] ${result.error}`)
+    if (Notification.isSupported()) new Notification({ title: 'Convert', body: result.error ?? '' }).show()
+  }
+  // Only a packaged app has a stable exe to start at login.
+  if (app.isPackaged) app.setLoginItemSettings({ openAtLogin: next.launchAtLogin, args: [FLAG_HIDDEN] })
+  tray?.update(next, explorerRegistered)
+}
 
-  if (process.env.ELECTRON_RENDERER_URL) {
-    void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
+async function setExplorerEntry(enabled: boolean): Promise<void> {
+  try {
+    if (enabled) await registerExplorerEntry(process.execPath)
+    else await unregisterExplorerEntry()
+  } catch (error) {
+    console.warn(`[shell] ${error instanceof Error ? error.message : String(error)}`)
+  }
+  explorerRegistered = await isExplorerEntryRegistered()
+  tray?.update(settings.get(), explorerRegistered)
+}
+
+/** Registers the Explorer verb once. Later runs respect a user who removed it. */
+async function firstRunSetup(): Promise<void> {
+  const marker = join(app.getPath('userData'), 'shell-registered')
+  if (app.isPackaged && !existsSync(marker)) {
+    await setExplorerEntry(true)
+    writeFileSync(marker, new Date().toISOString())
   } else {
-    void mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    explorerRegistered = await isExplorerEntryRegistered()
   }
 }
 
@@ -90,43 +157,76 @@ function registerIpc(): void {
   })
   ipcMain.handle(IPC.reveal, (_event, path: string) => shell.showItemInFolder(path))
   ipcMain.handle(IPC.getSettings, () => settings.get())
-  ipcMain.handle(IPC.updateSettings, (_event, patch: Partial<Settings>) => {
-    const next = settings.update(patch)
-    applySettings(next)
-    for (const window of BrowserWindow.getAllWindows()) window.webContents.send(IPC.settingsChanged, next)
-    return next
+  ipcMain.handle(IPC.updateSettings, (_event, patch: Partial<Settings>) => changeSettings(patch))
+}
+
+function openWindow(startHidden: boolean): void {
+  rendererReady = false
+  mainWindow = createMainWindow({
+    iconPath: iconPath(),
+    startHidden,
+    shouldHideOnClose: () => !quitting && settings.get().closeToTray && tray !== null,
+    onReady: () => {
+      rendererReady = true
+      flushFiles()
+    },
+    onClosed: () => {
+      mainWindow = null
+      rendererReady = false
+    }
   })
+  mainWindow.setAlwaysOnTop(settings.get().alwaysOnTop)
 }
 
-/** Pushes settings into the running app. Called at startup and after every change. */
-function applySettings(next: Settings): void {
-  mainWindow?.setAlwaysOnTop(next.alwaysOnTop)
-}
-
-if (!app.requestSingleInstanceLock()) {
+if (process.argv.includes(FLAG_UNREGISTER)) {
+  // Remove the Explorer entry and exit (also usable by hand).
+  void app.whenReady().then(async () => {
+    await unregisterExplorerEntry()
+    app.exit(0)
+  })
+} else if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
   app.on('second-instance', (_event, argv) => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.show()
-      mainWindow.focus()
-    }
-    sendOpenedFiles(filesFromArgv(argv))
+    const files = filesFromArgv(argv)
+    if (files.length > 0) batcher.add(files)
+    else showWindow(mainWindow)
   })
 
-  void app.whenReady().then(() => {
+  void app.whenReady().then(async () => {
     settings = new SettingsStore(join(app.getPath('userData'), 'settings.json'))
     registerIpc()
-    createWindow()
+    const files = filesFromArgv(process.argv)
+    openWindow(process.argv.includes(FLAG_HIDDEN) && files.length === 0)
+    await firstRunSetup()
+    tray = new AppTray(iconPath(), settings.get(), {
+      show: () => showWindow(mainWindow),
+      convertFiles: () => void pickAndSendFiles(),
+      openOutputFolder,
+      setLaunchAtLogin: (value) => changeSettings({ launchAtLogin: value }),
+      setExplorerEntry: (value) => void setExplorerEntry(value),
+      quit: () => app.quit()
+    })
     applySettings(settings.get())
+    // The first launch of a multi-selection gets one path; the rest arrive as second-instance.
+    batcher.add(files)
+
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+      if (!mainWindow) openWindow(false)
     })
   })
 
-  app.on('before-quit', () => queue.cancelAll())
+  app.on('before-quit', () => {
+    quitting = true
+    queue.cancelAll()
+  })
+  app.on('will-quit', () => {
+    shortcuts.dispose()
+    batcher.dispose()
+    tray?.destroy()
+  })
+  // The tray keeps the app alive; quitting goes through the tray or `app.quit()`.
   app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') app.quit()
+    if (!tray) app.quit()
   })
 }
